@@ -190,7 +190,8 @@ namespace AutoImportPlugin
                                     Type = GameActionType.File,
                                     Path = fileInfo.FullName,
                                     WorkingDir = fileInfo.DirectoryName,
-                                    Name = "Play"
+                                    Name = "Play" ,
+                                    IsPlayAction = true
                                 }
                             }
                         };
