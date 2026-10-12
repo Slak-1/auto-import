@@ -128,6 +128,22 @@ namespace AutoImportPlugin
                             var importedGame = PlayniteApi.Database.ImportGame(game, this);
                             if (importedGame != null)
                             {
+                                // Option A: keep Playnite's existing "Last Played" sort order,
+                                // while placing a freshly imported game at the top. This updates
+                                // LastActivity only; Playtime and PlayCount remain unchanged.
+                                try
+                                {
+                                    importedGame.LastActivity = DateTime.Now;
+                                    PlayniteApi.Database.Games.Update(importedGame);
+                                    logger.Info($"Set LastActivity to the import time for '{importedGame.Name}'.");
+                                }
+                                catch (Exception ex)
+                                {
+                                    // A sort-position update must not undo a successful import or
+                                    // prevent the normal metadata-download path from running.
+                                    logger.Warn(ex, $"Imported '{importedGame.Name}', but could not update its LastActivity.");
+                                }
+
                                 importedGames.Add(importedGame);
                                 importedCount++;
                             }
