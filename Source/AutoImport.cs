@@ -6,7 +6,9 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Text.RegularExpressions;
 
@@ -21,6 +23,8 @@ namespace AutoImportPlugin
         // Shared by the normal library scan and the URI-triggered scan so they
         // cannot open two selection windows at the same time.
         private int scanInProgress;
+        // Keep host metadata-download requests serialized without blocking new scans.
+        private readonly SemaphoreSlim metadataDownloadGate = new SemaphoreSlim(1, 1);
 
         public override Guid Id { get; } = Guid.Parse("92c96e54-069b-4fc4-bbaa-35ac3064f85a");
         public override string Name => "AutoImport";
@@ -77,7 +81,7 @@ namespace AutoImportPlugin
             }
         }
 
-        private void HandleUri(PlayniteUriEventArgs args)
+        private async void HandleUri(PlayniteUriEventArgs args)
         {
             // Only accept playnite://autoimport/scan.
             if (args?.Arguments == null ||
@@ -96,6 +100,7 @@ namespace AutoImportPlugin
                 return;
             }
 
+            bool scanGateReleasedBeforeMetadata = false;
             try
             {
                 var selectedGames = ScanAndSelectGames();
@@ -113,14 +118,19 @@ namespace AutoImportPlugin
                 }
 
                 int importedCount = 0;
+                var importedGames = new List<Game>();
                 dispatcher.Invoke(() =>
                 {
                     foreach (var game in selectedGames)
                     {
                         try
                         {
-                            PlayniteApi.Database.ImportGame(game, this);
-                            importedCount++;
+                            var importedGame = PlayniteApi.Database.ImportGame(game, this);
+                            if (importedGame != null)
+                            {
+                                importedGames.Add(importedGame);
+                                importedCount++;
+                            }
                         }
                         catch (Exception ex)
                         {
@@ -130,6 +140,20 @@ namespace AutoImportPlugin
                 });
 
                 logger.Info($"AutoImport URI scan finished. Imported {importedCount} game(s).");
+
+                // Imports initiated directly from a URI do not pass through Playnite's
+                // regular library-update pipeline, which normally schedules metadata
+                // downloads. Reuse the host's metadata downloader for the newly added
+                // games so existing metadata-source settings and fields are respected.
+                if (importedGames.Count > 0)
+                {
+                    // The scan/import is finished. Release the scan gate before waiting
+                    // on a potentially slow network operation, so another FDM signal
+                    // isn't dropped while Playnite downloads metadata.
+                    Interlocked.Exchange(ref scanInProgress, 0);
+                    scanGateReleasedBeforeMetadata = true;
+                    await DownloadMetadataAfterUriImportAsync(importedGames);
+                }
             }
             catch (Exception ex)
             {
@@ -137,8 +161,136 @@ namespace AutoImportPlugin
             }
             finally
             {
-                Interlocked.Exchange(ref scanInProgress, 0);
+                // If metadata is being downloaded, this handler already released the
+                // gate above. Don't clear a gate acquired by a newer scan meanwhile.
+                if (!scanGateReleasedBeforeMetadata)
+                {
+                    Interlocked.Exchange(ref scanInProgress, 0);
+                }
             }
+        }
+
+        private async Task DownloadMetadataAfterUriImportAsync(List<Game> importedGames)
+        {
+            if (importedGames == null || importedGames.Count == 0)
+            {
+                return;
+            }
+
+            bool metadataGateAcquired = false;
+            try
+            {
+                // Serialize these calls because Playnite's own downloader manages one
+                // global metadata task at a time. This doesn't block the scan trigger.
+                await metadataDownloadGate.WaitAsync().ConfigureAwait(false);
+                metadataGateAcquired = true;
+
+                // Follow Playnite's own setting: don't start a background metadata download
+                // if the user has disabled automatic metadata downloads after importing.
+                if (PlayniteApi.ApplicationSettings == null || !PlayniteApi.ApplicationSettings.DownloadMetadataOnImport)
+                {
+                    logger.Info("Automatic metadata download is disabled in Playnite settings; skipping metadata download for URI-imported games.");
+                    return;
+                }
+
+                var application = Application.Current;
+                if (application?.Dispatcher == null)
+                {
+                    logger.Warn("Could not start metadata download because the WPF dispatcher is unavailable.");
+                    return;
+                }
+
+                Task metadataTask = null;
+                application.Dispatcher.Invoke(() =>
+                {
+                    var viewModel = application.MainWindow?.DataContext;
+                    if (viewModel == null)
+                    {
+                        logger.Warn("Could not start metadata download because Playnite's main view model was not found.");
+                        return;
+                    }
+
+                    // MetadataDownloaderSettings and the metadata download method are
+                    // host-internal types, not part of the public plugin SDK. Resolve
+                    // them at runtime to avoid adding a dependency on Playnite internals.
+                    const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+                    var appSettingsProperty = FindProperty(viewModel.GetType(), "AppSettings", flags);
+                    var appSettings = appSettingsProperty?.GetValue(viewModel, null);
+                    var metadataSettingsProperty = appSettings == null ? null : FindProperty(appSettings.GetType(), "MetadataSettings", flags);
+                    var metadataSettings = metadataSettingsProperty?.GetValue(appSettings, null);
+
+                    if (metadataSettings == null)
+                    {
+                        logger.Warn("Could not start metadata download because Playnite's metadata settings were not found.");
+                        return;
+                    }
+
+                    var downloadMethod = viewModel.GetType().GetMethods(flags)
+                        .FirstOrDefault(method =>
+                        {
+                            if (method.Name != "DownloadMetadata" || !typeof(Task).IsAssignableFrom(method.ReturnType))
+                            {
+                                return false;
+                            }
+
+                            var parameters = method.GetParameters();
+                            return parameters.Length == 2 &&
+                                parameters[0].ParameterType.IsInstanceOfType(metadataSettings) &&
+                                parameters[1].ParameterType.IsAssignableFrom(typeof(List<Game>));
+                        });
+
+                    if (downloadMethod == null)
+                    {
+                        logger.Warn("Could not start metadata download because Playnite's metadata download method was not found. The game import itself succeeded.");
+                        return;
+                    }
+
+                    try
+                    {
+                        metadataTask = downloadMethod.Invoke(viewModel, new object[] { metadataSettings, importedGames }) as Task;
+                    }
+                    catch (TargetInvocationException ex)
+                    {
+                        logger.Error(ex.InnerException ?? ex, "Playnite failed to start metadata download for URI-imported games.");
+                    }
+                });
+
+                if (metadataTask != null)
+                {
+                    await metadataTask.ConfigureAwait(false);
+                    logger.Info($"Metadata download finished for {importedGames.Count} URI-imported game(s).");
+                }
+                else
+                {
+                    logger.Warn("Metadata download was not started for URI-imported games; see earlier log messages for details.");
+                }
+            }
+            catch (Exception ex)
+            {
+                // Metadata failure must not undo or misreport a successful game import.
+                logger.Error(ex, "Failed to download metadata for URI-imported games.");
+            }
+            finally
+            {
+                if (metadataGateAcquired)
+                {
+                    metadataDownloadGate.Release();
+                }
+            }
+        }
+
+        private static PropertyInfo FindProperty(Type type, string propertyName, BindingFlags flags)
+        {
+            for (var current = type; current != null; current = current.BaseType)
+            {
+                var property = current.GetProperty(propertyName, flags | BindingFlags.DeclaredOnly);
+                if (property != null)
+                {
+                    return property;
+                }
+            }
+
+            return null;
         }
 
         private HashSet<string> BuildExistingGamesSet()
