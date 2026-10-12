@@ -1,4 +1,4 @@
-﻿using Playnite.SDK;
+using Playnite.SDK;
 using Playnite.SDK.Models;
 using Playnite.SDK.Plugins;
 using System;
@@ -141,6 +141,7 @@ namespace AutoImportPlugin
             {
                 foreach (var subDir in Directory.GetDirectories(rootPath))
                 {
+                    if (IsExcludedFolder(subDir)) continue;
                     results.AddRange(GetExecutablesInDir(subDir, blockedSet, existingSet));
                 }
             }
@@ -250,10 +251,29 @@ namespace AutoImportPlugin
             return Regex.Replace(clean, @"\s+", " ").Trim();
         }
 
+        // Parts of file names that mark an executable as NOT being a game.
+        // Add your own entries here (lowercase).
+        private static readonly string[] ExcludedFileNameParts =
+        {
+            "uninstall", "setup", "config", "crash",
+            "redist", "oalinst", "dotnet", "physx", "dgvoodoo"
+        };
+
         private bool IsGameExecutable(string path)
         {
-            string fileName = Path.GetFileName(path).ToLower();
-            return !(fileName.Contains("uninstall") || fileName.Contains("setup") || fileName.Contains("config") || fileName.Contains("crash"));
+            string fileName = Path.GetFileName(path).ToLowerInvariant();
+
+            // Inno Setup uninstallers: unins000.exe, unins001.exe, ...
+            if (fileName.StartsWith("unins")) return false;
+
+            return !ExcludedFileNameParts.Any(part => fileName.Contains(part));
+        }
+
+        // Skips whole folders that only hold helper installers, e.g. _CommonRedist
+        private bool IsExcludedFolder(string dirPath)
+        {
+            string name = Path.GetFileName(dirPath).ToLowerInvariant();
+            return name.StartsWith("_") || name.Contains("redist");
         }
     }
 }
