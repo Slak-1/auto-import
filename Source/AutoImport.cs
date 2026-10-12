@@ -1,10 +1,12 @@
 using Playnite.SDK;
+using Playnite.SDK.Events;
 using Playnite.SDK.Models;
 using Playnite.SDK.Plugins;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Windows;
 using System.Text.RegularExpressions;
 
@@ -15,6 +17,11 @@ namespace AutoImportPlugin
         private static readonly ILogger logger = LogManager.GetLogger();
         private AutoImportSettingsViewModel settings { get; set; }
 
+        private const string UriSource = "autoimport";
+        // Shared by the normal library scan and the URI-triggered scan so they
+        // cannot open two selection windows at the same time.
+        private int scanInProgress;
+
         public override Guid Id { get; } = Guid.Parse("92c96e54-069b-4fc4-bbaa-35ac3064f85a");
         public override string Name => "AutoImport";
 
@@ -22,6 +29,24 @@ namespace AutoImportPlugin
         {
             settings = new AutoImportSettingsViewModel(this);
             Properties = new LibraryPluginProperties { HasSettings = true };
+
+            // Allows an external script to request a scan with:
+            // playnite://autoimport/scan
+            PlayniteApi.UriHandler.RegisterSource(UriSource, HandleUri);
+        }
+
+        public override void Dispose()
+        {
+            try
+            {
+                PlayniteApi.UriHandler.RemoveSource(UriSource);
+            }
+            catch (Exception ex)
+            {
+                logger.Warn(ex, "Failed to unregister AutoImport URI handler");
+            }
+
+            base.Dispose();
         }
 
         public override ISettings GetSettings(bool firstRunSettings) => settings;
@@ -29,7 +54,91 @@ namespace AutoImportPlugin
 
         public override IEnumerable<GameMetadata> GetGames(LibraryGetGamesArgs args)
         {
-            return ScanAndSelectGames();
+            return RunScanWithGate();
+        }
+
+        private List<GameMetadata> RunScanWithGate()
+        {
+            if (Interlocked.CompareExchange(ref scanInProgress, 1, 0) != 0)
+            {
+                logger.Info("AutoImport scan skipped because another scan is already running.");
+                return new List<GameMetadata>();
+            }
+
+            try
+            {
+                // This is the normal library-plugin path: Playnite imports the returned
+                // GameMetadata objects after GetGames completes.
+                return ScanAndSelectGames();
+            }
+            finally
+            {
+                Interlocked.Exchange(ref scanInProgress, 0);
+            }
+        }
+
+        private void HandleUri(PlayniteUriEventArgs args)
+        {
+            // Only accept playnite://autoimport/scan.
+            if (args?.Arguments == null ||
+                args.Arguments.Length == 0 ||
+                !string.Equals(args.Arguments[0], "scan", StringComparison.OrdinalIgnoreCase))
+            {
+                logger.Warn("Ignored an AutoImport URI that did not request a scan.");
+                return;
+            }
+
+            if (Interlocked.CompareExchange(ref scanInProgress, 1, 0) != 0)
+            {
+                // A scan or its selection window is already active. Dropping the
+                // overlapping request avoids spawning a second selection window.
+                logger.Info("AutoImport URI scan skipped because another scan is already running.");
+                return;
+            }
+
+            try
+            {
+                var selectedGames = ScanAndSelectGames();
+                if (selectedGames.Count == 0)
+                {
+                    logger.Info("AutoImport URI scan finished; no games were selected for import.");
+                    return;
+                }
+
+                var dispatcher = Application.Current?.Dispatcher;
+                if (dispatcher == null)
+                {
+                    logger.Error("Cannot import AutoImport results because the WPF dispatcher is unavailable.");
+                    return;
+                }
+
+                int importedCount = 0;
+                dispatcher.Invoke(() =>
+                {
+                    foreach (var game in selectedGames)
+                    {
+                        try
+                        {
+                            PlayniteApi.Database.ImportGame(game, this);
+                            importedCount++;
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.Error(ex, $"Failed to import '{game?.Name ?? "(unnamed game)"}' from AutoImport URI scan.");
+                        }
+                    }
+                });
+
+                logger.Info($"AutoImport URI scan finished. Imported {importedCount} game(s).");
+            }
+            catch (Exception ex)
+            {
+                logger.Error(ex, "AutoImport URI scan failed.");
+            }
+            finally
+            {
+                Interlocked.Exchange(ref scanInProgress, 0);
+            }
         }
 
         private HashSet<string> BuildExistingGamesSet()
@@ -43,7 +152,6 @@ namespace AutoImportPlugin
                     {
                         if (!string.IsNullOrEmpty(game.InstallDirectory))
                             existingSet.Add(NormalizePath(game.InstallDirectory));
-
                         if (game.GameActions != null)
                         {
                             foreach (var action in game.GameActions)
@@ -62,7 +170,6 @@ namespace AutoImportPlugin
                 logger.Error(ex, "Failed to build existing games set");
                 return new HashSet<string>();
             }
-
             return existingSet;
         }
 
@@ -77,7 +184,6 @@ namespace AutoImportPlugin
             var allFoundGames = new List<ScannedGameWrapper>();
 
             if (settings.Settings.ScanFolders == null) return new List<GameMetadata>();
-
             var blockedSet = new HashSet<string>();
             if (settings.Settings.BlockedPaths != null)
             {
@@ -88,7 +194,6 @@ namespace AutoImportPlugin
             }
 
             var existingSet = BuildExistingGamesSet();
-
             foreach (var folder in settings.Settings.ScanFolders)
             {
                 if (Directory.Exists(folder))
@@ -100,7 +205,6 @@ namespace AutoImportPlugin
             if (allFoundGames.Count == 0) return new List<GameMetadata>();
 
             List<GameMetadata> finalSelection = new List<GameMetadata>();
-
             Application.Current.Dispatcher.Invoke(() =>
             {
                 var window = new GameSelectionWindow(allFoundGames);
@@ -109,12 +213,10 @@ namespace AutoImportPlugin
                 if (window.ShowDialog() == true)
                 {
                     finalSelection = window.SelectedGames.Select(game => game.GameData).ToList();
-
                     var newlyIgnored = allFoundGames
                         .Where(game => game.IsIgnored)
                         .Select(game => game.ExecutablePath)
                         .ToList();
-
                     if (newlyIgnored.Count > 0)
                     {
                         foreach (var path in newlyIgnored)
@@ -128,7 +230,6 @@ namespace AutoImportPlugin
                     }
                 }
             });
-
             return finalSelection;
         }
 
@@ -136,7 +237,6 @@ namespace AutoImportPlugin
         {
             var results = new List<ScannedGameWrapper>();
             results.AddRange(GetExecutablesInDir(rootPath, blockedSet, existingSet));
-
             try
             {
                 foreach (var subDir in Directory.GetDirectories(rootPath))
@@ -162,20 +262,15 @@ namespace AutoImportPlugin
                 {
                     string normalizedFile = NormalizePath(file);
                     string normalizedDir = NormalizePath(dirPath);
-
                     bool isIgnored = blockedSet.Contains(normalizedFile) || blockedSet.Contains(normalizedDir);
                     if (isIgnored) continue;
 
                     bool alreadyExists = existingSet.Contains(normalizedFile) || existingSet.Contains(normalizedDir);
                     if (alreadyExists) continue;
-
-
-
                     if (IsGameExecutable(file))
                     {
                         var fileInfo = new FileInfo(file);
                         string gameName = GetGameNameFromFolderOrExe(dirPath, fileInfo);
-
                         var metadata = new GameMetadata
                         {
                             Name = gameName,
@@ -191,7 +286,7 @@ namespace AutoImportPlugin
                                     Type = GameActionType.File,
                                     Path = fileInfo.FullName,
                                     WorkingDir = fileInfo.DirectoryName,
-                                    Name = "Play" ,
+                                    Name = "Play",
                                     IsPlayAction = true
                                 }
                             }
@@ -218,7 +313,6 @@ namespace AutoImportPlugin
                     return cleanFolderName;
                 }
             }
-
             string rawExeName = Path.GetFileNameWithoutExtension(fileInfo.Name);
             return CleanGameName(rawExeName);
         }
@@ -226,14 +320,13 @@ namespace AutoImportPlugin
         private bool IsValidGameName(string name)
         {
             if (string.IsNullOrWhiteSpace(name)) return false;
-            
-            if (name.Length < 2) return false;
 
+            if (name.Length < 2) return false;
             string lowerName = name.ToLowerInvariant();
-            string[] genericNames = { "bin", "game", "games", "exe", "exes", "program", "programs", 
-                                     "application", "applications", "software", "tools", "util", 
-                                     "utils", "temp", "tmp", "download", "downloads" };
-            
+            string[] genericNames = { "bin", "game", "games", "exe", "exes", "program", "programs",
+                                      "application", "applications", "software", "tools", "util",
+                                      "utils", "temp", "tmp", "download", "downloads" };
+
             return !genericNames.Contains(lowerName);
         }
 
@@ -242,12 +335,10 @@ namespace AutoImportPlugin
             if (string.IsNullOrWhiteSpace(filename)) return filename;
 
             string clean = filename.Replace('.', ' ').Replace('_', ' ');
-
             clean = Regex.Replace(clean, @"\[.*?\]|\(.*?\)", "");
 
             string junkPattern = @"\bv?(\d+(\.\d+)+)\b|repack|goty|edition|remastered|x64|x86|build|setup|installer";
             clean = Regex.Replace(clean, junkPattern, "", RegexOptions.IgnoreCase);
-
             return Regex.Replace(clean, @"\s+", " ").Trim();
         }
 
