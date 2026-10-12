@@ -202,7 +202,25 @@ namespace AutoImportPlugin
                 }
             }
 
+            // A game can be found more than once if configured scan folders overlap.
+            // Count unique executable paths so a single game never looks like a batch.
+            allFoundGames = allFoundGames
+                .GroupBy(game => NormalizePath(game.ExecutablePath), StringComparer.OrdinalIgnoreCase)
+                .Select(group => group.First())
+                .ToList();
+
             if (allFoundGames.Count == 0) return new List<GameMetadata>();
+
+            // If exactly one eligible, new game remains after filtering, import it
+            // without showing the selection window. This works for both Playnite's
+            // normal library scan (returned metadata) and the URI-triggered scan
+            // (which imports the returned metadata through the database API).
+            // Multiple candidates still use the existing selection window.
+            if (allFoundGames.Count == 1)
+            {
+                logger.Info($"AutoImport found one eligible game ('{allFoundGames[0].GameData?.Name ?? "(unnamed game)"}'); importing without showing the selection window.");
+                return new List<GameMetadata> { allFoundGames[0].GameData };
+            }
 
             List<GameMetadata> finalSelection = new List<GameMetadata>();
             Application.Current.Dispatcher.Invoke(() =>
